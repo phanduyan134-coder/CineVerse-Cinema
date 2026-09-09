@@ -1,4 +1,4 @@
-﻿# Byte-compiled / optimized / DLL files
+# Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
 *.class
@@ -15,5 +15,7 @@ venv/
 Thumbs.db
 .vscode/
 .idea/
-*.bak
-*.tmp
+# Local reports and presentation files (kept local for submission)
+docs/*.docx
+docs/AI_DECLARATION.md
+docs/KICH_BAN_DEMO_VA_SLIDE.md
