@@ -298,7 +298,7 @@ class CinemaService:
         SELECT bd.seat_code 
         FROM booking_details bd
         JOIN bookings b ON bd.booking_id = b.id
-        WHERE b.showtime_id = ? AND b.status = 'Confirmed'
+        WHERE b.showtime_id = ? AND b.status IN ('Confirmed', 'Checked-in')
         """, (showtime_id,))
         booked_codes = {r['seat_code'] for r in cursor.fetchall()}
         conn.close()
@@ -327,7 +327,7 @@ class CinemaService:
             SELECT bd.seat_code 
             FROM booking_details bd
             JOIN bookings b ON bd.booking_id = b.id
-            WHERE b.showtime_id = ? AND b.status = 'Confirmed'
+            WHERE b.showtime_id = ? AND b.status IN ('Confirmed', 'Checked-in')
             """, (showtime_id,))
             already_booked = {r['seat_code'] for r in cursor.fetchall()}
 

@@ -34,7 +34,8 @@ CREATE TABLE users (
     email NVARCHAR(100),
     phone NVARCHAR(20),
     role NVARCHAR(20) NOT NULL DEFAULT 'customer', -- 'admin', 'staff', 'customer'
-    created_at DATETIME DEFAULT GETDATE()
+    created_at DATETIME DEFAULT GETDATE(),
+    CONSTRAINT CK_users_role CHECK (role IN ('admin', 'staff', 'customer'))
 );
 GO
 
@@ -49,7 +50,8 @@ CREATE TABLE movies (
     release_date NVARCHAR(20),
     poster_path NVARCHAR(255) DEFAULT '',
     trailer_url NVARCHAR(255) DEFAULT '',
-    is_active INT DEFAULT 1 -- 1: Đang chiếu, 0: Ngừng chiếu
+    is_active INT DEFAULT 1, -- 1: Đang chiếu, 0: Ngừng chiếu
+    CONSTRAINT CK_movies_duration CHECK (duration > 0)
 );
 GO
 
@@ -58,7 +60,8 @@ CREATE TABLE rooms (
     id INT IDENTITY(1,1) PRIMARY KEY,
     name NVARCHAR(100) NOT NULL,
     total_rows INT NOT NULL, -- Số hàng (ví dụ: 6 hàng A -> F)
-    total_cols INT NOT NULL  -- Số ghế mỗi hàng (ví dụ: 8)
+    total_cols INT NOT NULL,  -- Số ghế mỗi hàng (ví dụ: 8)
+    CONSTRAINT CK_rooms_dimensions CHECK (total_rows > 0 AND total_cols > 0)
 );
 GO
 
@@ -70,7 +73,8 @@ CREATE TABLE seats (
     seat_num INT NOT NULL,            -- 1, 2, 3, ...
     seat_code NVARCHAR(10) NOT NULL,  -- A1, A2, B3...
     seat_type NVARCHAR(50) NOT NULL DEFAULT 'Standard', -- 'Standard', 'VIP', 'Nebula', 'Galaxy VIP', 'Supernova'
-    CONSTRAINT UQ_room_seat UNIQUE (room_id, seat_code)
+    CONSTRAINT UQ_room_seat UNIQUE (room_id, seat_code),
+    CONSTRAINT CK_seats_num CHECK (seat_num > 0)
 );
 GO
 
@@ -81,7 +85,8 @@ CREATE TABLE showtimes (
     room_id INT NOT NULL FOREIGN KEY REFERENCES rooms(id) ON DELETE CASCADE,
     show_date NVARCHAR(20) NOT NULL,  -- Định dạng YYYY-MM-DD
     show_time NVARCHAR(20) NOT NULL,  -- Định dạng HH:MM (vd: 19:30)
-    base_price FLOAT NOT NULL          -- Giá vé cơ bản (VNĐ)
+    base_price FLOAT NOT NULL,         -- Giá vé cơ bản (VNĐ)
+    CONSTRAINT CK_showtimes_price CHECK (base_price >= 0)
 );
 GO
 
@@ -94,7 +99,9 @@ CREATE TABLE bookings (
     total_amount FLOAT NOT NULL,
     booking_date DATETIME DEFAULT GETDATE(),
     payment_method NVARCHAR(100) DEFAULT N'Tiền mặt / Trực tuyến',
-    status NVARCHAR(50) DEFAULT 'Confirmed'    -- 'Confirmed', 'Checked-in', 'Cancelled'
+    status NVARCHAR(50) DEFAULT 'Confirmed',   -- 'Confirmed', 'Checked-in', 'Cancelled'
+    CONSTRAINT CK_bookings_amount CHECK (total_amount >= 0),
+    CONSTRAINT CK_bookings_status CHECK (status IN ('Confirmed', 'Checked-in', 'Cancelled'))
 );
 GO
 
@@ -104,7 +111,8 @@ CREATE TABLE booking_details (
     booking_id INT NOT NULL FOREIGN KEY REFERENCES bookings(id) ON DELETE CASCADE,
     seat_id INT NOT NULL FOREIGN KEY REFERENCES seats(id),
     seat_code NVARCHAR(10) NOT NULL,
-    price FLOAT NOT NULL
+    price FLOAT NOT NULL,
+    CONSTRAINT CK_booking_details_price CHECK (price >= 0)
 );
 GO
 
@@ -116,7 +124,8 @@ CREATE TABLE concessions (
     price FLOAT NOT NULL,
     description NVARCHAR(255),
     icon NVARCHAR(20) DEFAULT N'🍿',
-    is_active INT DEFAULT 1         -- 1: Đang bán, 0: Tạm ngưng
+    is_active INT DEFAULT 1,        -- 1: Đang bán, 0: Tạm ngưng
+    CONSTRAINT CK_concessions_price CHECK (price >= 0)
 );
 GO
 
@@ -127,7 +136,8 @@ CREATE TABLE booking_concessions (
     concession_id INT NOT NULL FOREIGN KEY REFERENCES concessions(id),
     concession_name NVARCHAR(100) NOT NULL,
     quantity INT NOT NULL,
-    price FLOAT NOT NULL
+    price FLOAT NOT NULL,
+    CONSTRAINT CK_booking_concessions_qty CHECK (quantity > 0 AND price >= 0)
 );
 GO
 
@@ -140,6 +150,15 @@ CREATE TABLE booking_logs (
     changed_at DATETIME DEFAULT GETDATE(),
     action_note NVARCHAR(255)
 );
+GO
+
+-- 2.11. Chỉ Mục Tối Ưu Hóa Truy Vấn (Non-Clustered Indexes - Tối ưu O(log N))
+CREATE NONCLUSTERED INDEX IX_bookings_user_id ON bookings(user_id);
+CREATE NONCLUSTERED INDEX IX_bookings_showtime_id ON bookings(showtime_id);
+CREATE NONCLUSTERED INDEX IX_bookings_code ON bookings(booking_code);
+CREATE NONCLUSTERED INDEX IX_booking_details_booking_id ON booking_details(booking_id);
+CREATE NONCLUSTERED INDEX IX_showtimes_movie_date ON showtimes(movie_id, show_date);
+CREATE NONCLUSTERED INDEX IX_seats_room_id ON seats(room_id);
 GO
 
 -- ====================================================================
@@ -390,6 +409,49 @@ LEFT JOIN booking_concessions bc ON c.id = bc.concession_id
 GROUP BY c.id, c.name, c.category;
 GO
 
+-- 4.4. Hàm Vô Hướng (Scalar Function) tính giá vé theo loại ghế
+CREATE OR ALTER FUNCTION fn_CalculateSeatPrice
+(
+    @BasePrice FLOAT,
+    @SeatType NVARCHAR(50)
+)
+RETURNS FLOAT
+AS
+BEGIN
+    DECLARE @FinalPrice FLOAT;
+    IF @SeatType = N'Supernova'
+        SET @FinalPrice = @BasePrice + 50000.0;
+    ELSE IF @SeatType LIKE N'%VIP%'
+        SET @FinalPrice = @BasePrice + 20000.0;
+    ELSE
+        SET @FinalPrice = @BasePrice;
+    RETURN @FinalPrice;
+END;
+GO
+
+-- 4.5. Hàm Trả Về Bảng (Inline Table-Valued Function) lấy danh sách ghế trống của một suất chiếu
+CREATE OR ALTER FUNCTION fn_GetAvailableSeats
+(
+    @ShowtimeID INT
+)
+RETURNS TABLE
+AS
+RETURN
+(
+    SELECT s.id AS seat_id, s.room_id, s.row_label, s.seat_num, s.seat_code, s.seat_type
+    FROM seats s
+    JOIN showtimes st ON s.room_id = st.room_id
+    WHERE st.id = @ShowtimeID
+      AND s.seat_code NOT IN (
+          SELECT bd.seat_code
+          FROM booking_details bd
+          JOIN bookings b ON bd.booking_id = b.id
+          WHERE b.showtime_id = @ShowtimeID
+            AND b.status IN ('Confirmed', 'Checked-in')
+      )
+);
+GO
+
 -- ====================================================================
 -- 5. THỦ TỤC LƯU TRỮ (STORED PROCEDURES)
 -- ====================================================================
@@ -520,6 +582,59 @@ BEGIN
 END;
 GO
 
+-- 5.4. Procedure Hủy Vé Có Quản Lý Giao Dịch ACID (Transaction & TRY...CATCH)
+CREATE OR ALTER PROCEDURE sp_CancelBookingWithTransaction
+    @BookingID INT,
+    @ResultCode INT OUTPUT,          -- 1: Thành công, 0: Đã hủy trước đó, -1: Không tìm thấy, -99: Lỗi hệ thống
+    @ResultMessage NVARCHAR(255) OUTPUT
+AS
+BEGIN
+    SET NOCOUNT ON;
+    SET XACT_ABORT ON;
+
+    BEGIN TRY
+        BEGIN TRANSACTION;
+
+        -- 1. Kiểm tra sự tồn tại của đơn vé
+        IF NOT EXISTS (SELECT 1 FROM bookings WHERE id = @BookingID)
+        BEGIN
+            SET @ResultCode = -1;
+            SET @ResultMessage = N'Không tìm thấy đơn vé với ID này!';
+            ROLLBACK TRANSACTION;
+            RETURN;
+        END
+
+        -- 2. Kiểm tra nếu vé đã bị hủy trước đó
+        DECLARE @OldStatus NVARCHAR(50);
+        SELECT @OldStatus = status FROM bookings WHERE id = @BookingID;
+
+        IF @OldStatus = 'Cancelled'
+        BEGIN
+            SET @ResultCode = 0;
+            SET @ResultMessage = N'Vé này đã bị hủy trước đó!';
+            ROLLBACK TRANSACTION;
+            RETURN;
+        END
+
+        -- 3. Cập nhật trạng thái thành Cancelled (Kích hoạt Trigger ghi Audit Log)
+        UPDATE bookings 
+        SET status = 'Cancelled' 
+        WHERE id = @BookingID;
+
+        COMMIT TRANSACTION;
+
+        SET @ResultCode = 1;
+        SET @ResultMessage = N'Hủy vé và cập nhật trạng thái thành công!';
+    END TRY
+    BEGIN CATCH
+        IF @@TRANCOUNT > 0
+            ROLLBACK TRANSACTION;
+        SET @ResultCode = -99;
+        SET @ResultMessage = ERROR_MESSAGE();
+    END CATCH
+END;
+GO
+
 -- ====================================================================
 -- 6. BỘ KÍCH HOẠT TỰ ĐỘNG (TRIGGERS)
 -- ====================================================================
@@ -561,7 +676,7 @@ AS
 BEGIN
     SET NOCOUNT ON;
 
-    -- Kiểm tra xem ghế vừa chèn có trùng với bất kỳ vé Confirmed nào khác của cùng suất chiếu không
+    -- Kiểm tra xem ghế vừa chèn có trùng với bất kỳ vé Confirmed/Checked-in nào khác của cùng suất chiếu không
     IF EXISTS (
         SELECT 1
         FROM inserted i
@@ -584,25 +699,38 @@ GO
 -- Quét chọn từng khối lệnh dưới đây và bấm F5 để demo cho Giảng viên:
 -- ====================================================================
 /*
--- 1. Xem dữ liệu View:
+-- 1. Xem dữ liệu Khung nhìn (Views):
 SELECT * FROM v_TicketDetails;
 SELECT * FROM v_MovieRevenueStatistics ORDER BY total_ticket_revenue DESC;
 SELECT * FROM v_TopSellingConcessions ORDER BY total_quantity_sold DESC;
 
--- 2. Thực thi Stored Procedure lấy KPI Dashboard:
+-- 2. Thực thi Hàm do người dùng định nghĩa (User-Defined Functions - UDFs):
+-- - Hàm vô hướng (Scalar): Tính giá ghế VIP / Supernova
+SELECT dbo.fn_CalculateSeatPrice(100000, N'Galaxy VIP') AS GiaGheVIP,
+       dbo.fn_CalculateSeatPrice(100000, N'Supernova') AS GiaGheDoi;
+-- - Hàm trả về bảng (Table-Valued): Lấy toàn bộ ghế còn trống của suất chiếu số 1
+SELECT * FROM dbo.fn_GetAvailableSeats(1);
+
+-- 3. Thực thi Thủ tục lưu trữ (Stored Procedures):
+-- - Lấy KPI Dashboard quản trị:
 EXEC sp_GetDashboardKPIs;
-
--- 3. Thực thi Stored Procedure tìm suất chiếu:
+-- - Tra cứu lịch chiếu phim:
 EXEC sp_SearchShowtimes @MovieID = 1;
-
--- 4. Thực thi Stored Procedure Soát vé (Có tham số OUTPUT):
+-- - Nghiệp vụ soát vé tại quầy (Có tham số OUTPUT):
 DECLARE @code INT, @msg NVARCHAR(255);
 EXEC sp_CheckInTicket @BookingCode = N'VE2026MOCK001', @ResultCode = @code OUTPUT, @ResultMessage = @msg OUTPUT;
 SELECT @code AS [Mã Kết Quả], @msg AS [Thông Điệp];
+-- - Nghiệp vụ hủy vé an toàn với Transaction ACID:
+DECLARE @cancel_code INT, @cancel_msg NVARCHAR(255);
+EXEC sp_CancelBookingWithTransaction @BookingID = 1, @ResultCode = @cancel_code OUTPUT, @ResultMessage = @cancel_msg OUTPUT;
+SELECT @cancel_code AS [Mã Hủy Vé], @cancel_msg AS [Thông Điệp Hủy];
 
--- 5. Xem Trigger đã tự động ghi Nhật Ký (Audit Log):
+-- 4. Xem Trigger đã tự động ghi vết Nhật Ký (Audit Log):
 SELECT * FROM booking_logs;
+
+-- 5. Lệnh sao lưu Cơ sở dữ liệu (Database Backup):
+-- BACKUP DATABASE CineVerse TO DISK = 'C:\Backup\CineVerse_Backup.bak' WITH FORMAT, INIT, NAME = 'Full Backup CineVerse';
 */
 
-PRINT N'>>> HOÀN TẤT KHỞI TẠO CƠ SỞ DỮ LIỆU CINEVERSE (TABLES, VIEWS, STORED PROCEDURES, TRIGGERS) <<<';
+PRINT N'>>> HOÀN TẤT KHỞI TẠO CƠ SỞ DỮ LIỆU CINEVERSE (TABLES, CONSTRAINTS, INDEXES, VIEWS, FUNCTIONS, PROCEDURES, TRIGGERS) <<<';
 GO
