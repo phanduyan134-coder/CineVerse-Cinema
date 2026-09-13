@@ -131,6 +131,17 @@ CREATE TABLE booking_concessions (
 );
 GO
 
+-- 2.10. Bảng Nhật Ký Thay Đổi Trạng Thái Vé (Audit Log - Phục vụ Trigger)
+CREATE TABLE booking_logs (
+    id INT IDENTITY(1,1) PRIMARY KEY,
+    booking_id INT NOT NULL FOREIGN KEY REFERENCES bookings(id) ON DELETE CASCADE,
+    old_status NVARCHAR(50),
+    new_status NVARCHAR(50),
+    changed_at DATETIME DEFAULT GETDATE(),
+    action_note NVARCHAR(255)
+);
+GO
+
 -- ====================================================================
 -- 3. NẠP DỮ LIỆU MẪU BAN ĐẦU (SEED DATA - DML)
 -- ====================================================================
@@ -320,5 +331,278 @@ VALUES
 (@bk_id, @s2, N'C4', 95000.0);
 GO
 
-PRINT N'>>> HOÀN TẤT KHỞI TẠO CƠ SỞ DỮ LIỆU CINEVERSE TRÊN MICROSOFT SQL SERVER <<<';
+-- ====================================================================
+-- 4. KHUNG NHÌN (VIEWS) - PHỤC VỤ TRUY VẤN VÀ BÁO CÁO NHANH
+-- ====================================================================
+
+-- 4.1. View xem thông tin chi tiết đơn vé điện tử (Join 5 bảng liên quan)
+CREATE OR ALTER VIEW v_TicketDetails AS
+SELECT 
+    b.id AS booking_id,
+    b.booking_code,
+    u.fullname AS customer_name,
+    u.phone AS customer_phone,
+    m.title AS movie_title,
+    m.genre AS movie_genre,
+    r.name AS room_name,
+    st.show_date,
+    st.show_time,
+    b.total_amount,
+    b.booking_date,
+    b.payment_method,
+    b.status
+FROM bookings b
+JOIN users u ON b.user_id = u.id
+JOIN showtimes st ON b.showtime_id = st.id
+JOIN movies m ON st.movie_id = m.id
+JOIN rooms r ON st.room_id = r.id;
+GO
+
+-- 4.2. View báo cáo tổng hợp doanh thu và số vé bán ra theo từng phim
+CREATE OR ALTER VIEW v_MovieRevenueStatistics AS
+SELECT 
+    m.id AS movie_id,
+    m.title AS movie_title,
+    m.genre AS movie_genre,
+    COUNT(bd.id) AS total_tickets_sold,
+    COALESCE(SUM(bd.price), 0) AS total_ticket_revenue,
+    CASE 
+        WHEN COUNT(bd.id) > 0 THEN ROUND(COALESCE(SUM(bd.price), 0) / COUNT(bd.id), 0)
+        ELSE 0 
+    END AS avg_ticket_price
+FROM movies m
+LEFT JOIN showtimes st ON m.id = st.movie_id
+LEFT JOIN bookings b ON st.id = b.showtime_id AND b.status IN ('Confirmed', 'Checked-in')
+LEFT JOIN booking_details bd ON b.id = bd.booking_id
+GROUP BY m.id, m.title, m.genre;
+GO
+
+-- 4.3. View thống kê các món bắp nước F&B bán chạy nhất
+CREATE OR ALTER VIEW v_TopSellingConcessions AS
+SELECT 
+    c.id AS concession_id,
+    c.name AS item_name,
+    c.category,
+    COALESCE(SUM(bc.quantity), 0) AS total_quantity_sold,
+    COALESCE(SUM(bc.quantity * bc.price), 0) AS total_fnb_revenue
+FROM concessions c
+LEFT JOIN booking_concessions bc ON c.id = bc.concession_id
+GROUP BY c.id, c.name, c.category;
+GO
+
+-- ====================================================================
+-- 5. THỦ TỤC LƯU TRỮ (STORED PROCEDURES)
+-- ====================================================================
+
+-- 5.1. Procedure lấy các chỉ số KPI Dashboard nhanh chóng (Tổng doanh thu, vé, phim, khách)
+CREATE OR ALTER PROCEDURE sp_GetDashboardKPIs
+AS
+BEGIN
+    SET NOCOUNT ON;
+    
+    DECLARE @TotalRevenue FLOAT = 0;
+    DECLARE @TotalTickets INT = 0;
+    DECLARE @TotalMovies INT = 0;
+    DECLARE @TotalCustomers INT = 0;
+    DECLARE @TotalFnBRevenue FLOAT = 0;
+
+    -- Tổng doanh thu vé
+    SELECT @TotalRevenue = COALESCE(SUM(total_amount), 0)
+    FROM bookings 
+    WHERE status IN ('Confirmed', 'Checked-in');
+
+    -- Tổng số vé đã bán
+    SELECT @TotalTickets = COUNT(bd.id)
+    FROM booking_details bd
+    JOIN bookings b ON bd.booking_id = b.id
+    WHERE b.status IN ('Confirmed', 'Checked-in');
+
+    -- Tổng số phim đang chiếu
+    SELECT @TotalMovies = COUNT(*) 
+    FROM movies 
+    WHERE is_active = 1;
+
+    -- Tổng số khách hàng
+    SELECT @TotalCustomers = COUNT(*) 
+    FROM users 
+    WHERE role = 'customer';
+
+    -- Doanh thu bắp nước
+    SELECT @TotalFnBRevenue = COALESCE(SUM(quantity * price), 0)
+    FROM booking_concessions;
+
+    -- Trả về bảng kết quả
+    SELECT 
+        @TotalRevenue AS TotalRevenue,
+        @TotalTickets AS TotalTickets,
+        @TotalMovies AS TotalMovies,
+        @TotalCustomers AS TotalCustomers,
+        @TotalFnBRevenue AS TotalFnBRevenue;
+END;
+GO
+
+-- 5.2. Procedure nghiệp vụ Soát Vé tại Cổng (Check-in Ticket) có tham số OUTPUT
+CREATE OR ALTER PROCEDURE sp_CheckInTicket
+    @BookingCode NVARCHAR(50),
+    @ResultCode INT OUTPUT,          -- 1: Hợp lệ, 0: Vé đã soát, -1: Vé bị hủy, -2: Không tìm thấy
+    @ResultMessage NVARCHAR(255) OUTPUT
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    DECLARE @BookingID INT;
+    DECLARE @CurrentStatus NVARCHAR(50);
+    DECLARE @RoomName NVARCHAR(100);
+
+    SELECT 
+        @BookingID = b.id,
+        @CurrentStatus = b.status,
+        @RoomName = r.name
+    FROM bookings b
+    JOIN showtimes st ON b.showtime_id = st.id
+    JOIN rooms r ON st.room_id = r.id
+    WHERE UPPER(b.booking_code) = UPPER(@BookingCode);
+
+    IF @BookingID IS NULL
+    BEGIN
+        SET @ResultCode = -2;
+        SET @ResultMessage = N'Mã vé không tồn tại trên hệ thống CineVerse!';
+        RETURN;
+    END
+
+    IF @CurrentStatus = 'Checked-in'
+    BEGIN
+        SET @ResultCode = 0;
+        SET @ResultMessage = N'CẢNH BÁO: Vé này đã được soát vào rạp trước đó!';
+        RETURN;
+    END
+
+    IF @CurrentStatus = 'Cancelled'
+    BEGIN
+        SET @ResultCode = -1;
+        SET @ResultMessage = N'TỪ CHỐI: Vé này đã bị hủy hoặc hoàn tiền!';
+        RETURN;
+    END
+
+    -- Cập nhật trạng thái sang Checked-in
+    UPDATE bookings 
+    SET status = 'Checked-in' 
+    WHERE id = @BookingID;
+
+    SET @ResultCode = 1;
+    SET @ResultMessage = N'SOÁT VÉ HỢP LỆ! Mời quý khách vào ' + @RoomName;
+END;
+GO
+
+-- 5.3. Procedure tra cứu suất chiếu theo phim và ngày
+CREATE OR ALTER PROCEDURE sp_SearchShowtimes
+    @MovieID INT = NULL,
+    @ShowDate NVARCHAR(20) = NULL
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    SELECT 
+        st.id,
+        st.movie_id,
+        st.room_id,
+        m.title AS movie_title,
+        r.name AS room_name,
+        st.show_date,
+        st.show_time,
+        st.base_price
+    FROM showtimes st
+    JOIN movies m ON st.movie_id = m.id
+    JOIN rooms r ON st.room_id = r.id
+    WHERE (@MovieID IS NULL OR st.movie_id = @MovieID)
+      AND (@ShowDate IS NULL OR st.show_date = @ShowDate)
+    ORDER BY st.show_date ASC, st.show_time ASC;
+END;
+GO
+
+-- ====================================================================
+-- 6. BỘ KÍCH HOẠT TỰ ĐỘNG (TRIGGERS)
+-- ====================================================================
+
+-- 6.1. Trigger tự động ghi vết thay đổi trạng thái vé (Audit Log)
+CREATE OR ALTER TRIGGER trg_AuditBookingStatus
+ON bookings
+AFTER UPDATE
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    -- Chỉ kích hoạt ghi nhận log khi có thay đổi trường trạng thái status
+    IF UPDATE(status)
+    BEGIN
+        INSERT INTO booking_logs (booking_id, old_status, new_status, changed_at, action_note)
+        SELECT 
+            i.id,
+            d.status AS old_status,
+            i.status AS new_status,
+            GETDATE(),
+            CASE 
+                WHEN i.status = 'Checked-in' THEN N'Khách hàng đã quét mã soát vé tại cổng'
+                WHEN i.status = 'Cancelled' THEN N'Đơn vé đã bị hủy hoặc hoàn tiền'
+                ELSE N'Cập nhật trạng thái vé'
+            END
+        FROM inserted i
+        JOIN deleted d ON i.id = d.id
+        WHERE i.status <> d.status;
+    END
+END;
+GO
+
+-- 6.2. Trigger kiểm tra và ngăn chặn đặt trùng ghế ở tầng CSDL
+CREATE OR ALTER TRIGGER trg_PreventDuplicateSeat
+ON booking_details
+AFTER INSERT
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    -- Kiểm tra xem ghế vừa chèn có trùng với bất kỳ vé Confirmed nào khác của cùng suất chiếu không
+    IF EXISTS (
+        SELECT 1
+        FROM inserted i
+        JOIN bookings b_new ON i.booking_id = b_new.id
+        JOIN booking_details bd_old ON i.seat_id = bd_old.seat_id AND i.booking_id <> bd_old.booking_id
+        JOIN bookings b_old ON bd_old.booking_id = b_old.id
+        WHERE b_new.showtime_id = b_old.showtime_id
+          AND b_old.status IN ('Confirmed', 'Checked-in')
+    )
+    BEGIN
+        RAISERROR(N'Lỗi ràng buộc: Ghế này đã được khách hàng khác đặt trong cùng suất chiếu!', 16, 1);
+        ROLLBACK TRANSACTION;
+        RETURN;
+    END
+END;
+GO
+
+-- ====================================================================
+-- 7. CÂU LỆNH KIỂM THỬ MẪU (DÀNH CHO THUYẾT TRÌNH TRÊN SSMS)
+-- Quét chọn từng khối lệnh dưới đây và bấm F5 để demo cho Giảng viên:
+-- ====================================================================
+/*
+-- 1. Xem dữ liệu View:
+SELECT * FROM v_TicketDetails;
+SELECT * FROM v_MovieRevenueStatistics ORDER BY total_ticket_revenue DESC;
+SELECT * FROM v_TopSellingConcessions ORDER BY total_quantity_sold DESC;
+
+-- 2. Thực thi Stored Procedure lấy KPI Dashboard:
+EXEC sp_GetDashboardKPIs;
+
+-- 3. Thực thi Stored Procedure tìm suất chiếu:
+EXEC sp_SearchShowtimes @MovieID = 1;
+
+-- 4. Thực thi Stored Procedure Soát vé (Có tham số OUTPUT):
+DECLARE @code INT, @msg NVARCHAR(255);
+EXEC sp_CheckInTicket @BookingCode = N'VE2026MOCK001', @ResultCode = @code OUTPUT, @ResultMessage = @msg OUTPUT;
+SELECT @code AS [Mã Kết Quả], @msg AS [Thông Điệp];
+
+-- 5. Xem Trigger đã tự động ghi Nhật Ký (Audit Log):
+SELECT * FROM booking_logs;
+*/
+
+PRINT N'>>> HOÀN TẤT KHỞI TẠO CƠ SỞ DỮ LIỆU CINEVERSE (TABLES, VIEWS, STORED PROCEDURES, TRIGGERS) <<<';
 GO
