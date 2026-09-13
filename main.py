@@ -51,8 +51,17 @@ from ui.styles import enable_high_dpi
 class CinemaApp:
     """Bộ điều phối luồng ứng dụng chính (CineVerse Controller)"""
     def __init__(self):
+        # Hỗ trợ chuyển đổi nhanh CSDL qua tham số dòng lệnh (vd: python main.py --sqlserver)
+        from database import DatabaseManager
+        if "--sqlserver" in sys.argv or "-mssql" in sys.argv:
+            DatabaseManager().set_engine("SQLSERVER")
+        elif "--sqlite" in sys.argv:
+            DatabaseManager().set_engine("SQLITE")
+
+        engine_name = DatabaseManager().engine
+        print(f"[HỆ THỐNG] Đang kết nối cơ sở dữ liệu: {engine_name}...")
+
         # 1. Tự động kiểm tra và khởi tạo CSDL + Dữ liệu mẫu
-        print("[HỆ THỐNG] Đang khởi động cơ sở dữ liệu CINEVERSE...")
         init_database()
         seed_data()
 

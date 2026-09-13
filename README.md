@@ -89,15 +89,26 @@ Khi khởi chạy, phần mềm đã tự động nạp sẵn dữ liệu mẫu 
 Mở cửa sổ dòng lệnh (Terminal / Command Prompt / PowerShell) tại thư mục dự án:
 
 ```bash
-# 1. Cài đặt các thư viện hỗ trợ giao diện bo góc & ảnh (chỉ cần chạy 1 lần duy nhất):
-pip install customtkinter pillow
+# 1. Cài đặt các thư viện cần thiết (chỉ cần chạy 1 lần):
+pip install customtkinter pillow pyodbc
 
-# 2. Khởi chạy phần mềm CINEVERSE:
+# 2. Khởi chạy phần mềm CINEVERSE với CSDL SQLite mặc định (chạy ngay không cần cài đặt SQL Server):
 python main.py
 
-# 3. Chạy kiểm thử tự động toàn bộ 20 kịch bản hệ thống & Mẫu thiết kế OOP:
+# 3. HOẶC khởi chạy phần mềm kết nối Microsoft SQL Server (Theo chuyên đề CSDL SQL Server của Thầy):
+python main.py --sqlserver
+
+# 4. Chạy kiểm thử tự động toàn bộ 20/20 kịch bản hệ thống & Mẫu thiết kế OOP:
+# - Kiểm thử trên SQLite:
 python test_system.py
+# - Kiểm thử trên SQL Server:
+python -c "from database import DatabaseManager; DatabaseManager().set_engine('SQLSERVER'); import test_system; test_system.run_tests()"
 ```
+
+> **💡 Lưu ý về Cơ Sở Dữ Liệu SQL Server:**
+> - Hệ thống hỗ trợ kiến trúc **Dual-Database (CSDL Kép)**: Thiết kế tương thích hoàn hảo cả SQLite (file `cinema.db`) và Microsoft SQL Server (`localhost` - Database `CineVerse`).
+> - Script T-SQL chuẩn tạo Database và toàn bộ bảng dữ liệu nằm tại: `scripts/setup_sqlserver.sql` (có thể mở và thực thi trực tiếp trên SQL Server Management Studio - SSMS).
+> - Để chuyển đổi CSDL, bạn có thể truyền cờ `--sqlserver` / `--sqlite`, hoặc đặt biến môi trường `set CINEVERSE_DB_ENGINE=SQLSERVER`.
 
 ---
 

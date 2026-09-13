@@ -21,11 +21,137 @@ if sys.stdout and hasattr(sys.stdout, 'reconfigure'):
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_NAME = os.path.join(BASE_DIR, "cinema.db")
 
+# Cấu hình CSDL: Mặc định 'SQLITE' (dễ chạy không cần cài đặt), hoặc 'SQLSERVER' (theo chuyên đề SQL Server của Thầy)
+DB_ENGINE = os.getenv("CINEVERSE_DB_ENGINE", "SQLITE").upper()
+SQLSERVER_SERVER = os.getenv("CINEVERSE_SQL_SERVER", "localhost")
+SQLSERVER_DATABASE = os.getenv("CINEVERSE_SQL_DATABASE", "CineVerse")
+
+# Bắt lỗi vi phạm ràng buộc toàn vẹn cho cả SQLite và pyodbc (SQL Server)
+try:
+    import pyodbc
+    DB_INTEGRITY_ERRORS = (sqlite3.IntegrityError, pyodbc.IntegrityError)
+except ImportError:
+    pyodbc = None
+    DB_INTEGRITY_ERRORS = (sqlite3.IntegrityError,)
+
+
+class SQLServerRow(dict):
+    """
+    Adapter tương thích pyodbc.Row -> dict-like & tuple-like:
+    Hỗ trợ cả truy cập theo tên cột row['title'] và chỉ số row[0],
+    hỗ trợ dict(row), row.keys(), row.get(), so sánh không phân biệt hoa thường.
+    """
+    def __init__(self, cols, values):
+        super().__init__(zip(cols, values))
+        self._values = values
+        self._cols = cols
+
+    def __getitem__(self, item):
+        if isinstance(item, int):
+            return self._values[item]
+        if str(item) in self:
+            return super().__getitem__(str(item))
+        # Khớp không phân biệt hoa thường
+        item_lower = str(item).lower()
+        for k, v in self.items():
+            if k.lower() == item_lower:
+                return v
+        raise KeyError(item)
+
+    def __contains__(self, item):
+        if super().__contains__(item):
+            return True
+        item_lower = str(item).lower()
+        return any(k.lower() == item_lower for k in self.keys())
+
+
+class SQLServerCursor:
+    """
+    Cursor Adapter cho pyodbc:
+    Hỗ trợ cursor.lastrowid (qua SCOPE_IDENTITY()), fetchone() -> SQLServerRow, fetchall().
+    """
+    def __init__(self, raw_cursor):
+        self._cursor = raw_cursor
+        self.lastrowid = None
+
+    def execute(self, sql, params=None):
+        if params is not None:
+            res = self._cursor.execute(sql, params)
+        else:
+            res = self._cursor.execute(sql)
+
+        # Lấy ID mới chèn cho cursor.lastrowid tương thích SQLite
+        clean_sql = sql.strip().upper()
+        if clean_sql.startswith("INSERT"):
+            try:
+                self._cursor.execute("SELECT @@IDENTITY")
+                ident = self._cursor.fetchone()
+                if ident and ident[0] is not None:
+                    self.lastrowid = int(ident[0])
+            except Exception:
+                self.lastrowid = None
+        return self
+
+    def executemany(self, sql, params):
+        self._cursor.executemany(sql, params)
+        return self
+
+    def fetchone(self):
+        row = self._cursor.fetchone()
+        if row is None:
+            return None
+        cols = [col[0] for col in self._cursor.description]
+        return SQLServerRow(cols, row)
+
+    def fetchall(self):
+        rows = self._cursor.fetchall()
+        if not rows:
+            return []
+        cols = [col[0] for col in self._cursor.description]
+        return [SQLServerRow(cols, r) for r in rows]
+
+    def close(self):
+        self._cursor.close()
+
+    @property
+    def description(self):
+        return self._cursor.description
+
+
+class SQLServerConnection:
+    """Connection Wrapper cho pyodbc tương thích sqlite3.Connection API"""
+    def __init__(self, raw_conn):
+        self._conn = raw_conn
+
+    def cursor(self):
+        return SQLServerCursor(self._conn.cursor())
+
+    def commit(self):
+        self._conn.commit()
+
+    def rollback(self):
+        self._conn.rollback()
+
+    def close(self):
+        self._conn.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if exc_type:
+            self.rollback()
+        else:
+            self.commit()
+        self.close()
+
+
 class DatabaseManager:
     """
     Mẫu thiết kế Singleton (Singleton Pattern):
     Đảm bảo chỉ có một thể hiện duy nhất quản lý kết nối CSDL trong toàn bộ ứng dụng,
     bảo đảm an toàn đa luồng (Thread-safe) bằng threading.Lock.
+    Hỗ trợ linh hoạt cả 2 Engine: SQLite (file portable) và Microsoft SQL Server.
     """
     _instance = None
     _lock = threading.Lock()
@@ -36,14 +162,47 @@ class DatabaseManager:
                 if not cls._instance:
                     cls._instance = super().__new__(cls)
                     cls._instance.db_path = DB_NAME
+                    cls._instance.engine = DB_ENGINE
+                    cls._instance.sql_server = SQLSERVER_SERVER
+                    cls._instance.sql_database = SQLSERVER_DATABASE
+                    cls._instance._sql_driver = None
         return cls._instance
 
-    def get_connection(self) -> sqlite3.Connection:
-        """Tạo và trả về kết nối tới SQLite Database kèm PRAGMA foreign_keys"""
-        conn = sqlite3.connect(self.db_path)
-        conn.row_factory = sqlite3.Row  # Cho phép truy cập cột theo tên (dict-like)
-        conn.execute("PRAGMA foreign_keys = ON")
-        return conn
+    def set_engine(self, engine: str):
+        """Thay đổi engine CSDL linh hoạt: 'SQLITE' hoặc 'SQLSERVER'"""
+        with self._lock:
+            self.engine = engine.upper()
+
+    def _get_sqlserver_driver(self) -> str:
+        if self._sql_driver:
+            return self._sql_driver
+        if not pyodbc:
+            raise RuntimeError("pyodbc chưa được cài đặt. Vui lòng chạy 'pip install pyodbc' để dùng SQL Server.")
+        drivers = pyodbc.drivers()
+        for preferred in ['ODBC Driver 18 for SQL Server', 'ODBC Driver 17 for SQL Server', 'SQL Server']:
+            if preferred in drivers:
+                self._sql_driver = preferred
+                return preferred
+        raise RuntimeError("Không tìm thấy ODBC Driver cho SQL Server trên máy tính này.")
+
+    def get_connection(self):
+        """Tạo và trả về kết nối CSDL theo engine đã cấu hình"""
+        if self.engine == "SQLSERVER":
+            driver = self._get_sqlserver_driver()
+            conn_str = (
+                f"DRIVER={{{driver}}};"
+                f"SERVER={self.sql_server};"
+                f"DATABASE={self.sql_database};"
+                "Trusted_Connection=yes;"
+                "TrustServerCertificate=yes;"
+            )
+            raw_conn = pyodbc.connect(conn_str)
+            return SQLServerConnection(raw_conn)
+        else:
+            conn = sqlite3.connect(self.db_path)
+            conn.row_factory = sqlite3.Row  # Cho phép truy cập cột theo tên (dict-like)
+            conn.execute("PRAGMA foreign_keys = ON")
+            return conn
 
 def get_connection():
     """Hàm bao tương thích ngược: Lấy kết nối CSDL từ Singleton DatabaseManager"""
@@ -53,8 +212,51 @@ def hash_password(password: str) -> str:
     """Mã hóa mật khẩu bằng thuật toán SHA-256 (bảo mật chuẩn)"""
     return hashlib.sha256(password.encode('utf-8')).hexdigest()
 
+def init_sqlserver_database():
+    """Khởi tạo cấu trúc bảng trên Microsoft SQL Server nếu chưa có"""
+    if not pyodbc:
+        print("[WARN] Không tìm thấy pyodbc để kết nối SQL Server.")
+        return
+    try:
+        conn = get_connection()
+        cur = conn.cursor()
+        cur.execute("SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_NAME = 'users'")
+        row = cur.fetchone()
+        if row and row[0] > 0:
+            conn.close()
+            return
+        conn.close()
+    except Exception:
+        pass
+
+    # Nếu bảng chưa có, nạp cấu trúc từ scripts/setup_sqlserver.sql
+    sql_file = os.path.join(BASE_DIR, "scripts", "setup_sqlserver.sql")
+    if os.path.exists(sql_file):
+        print("[INFO] Đang khởi tạo CSDL CineVerse trên Microsoft SQL Server...")
+        driver = DatabaseManager()._get_sqlserver_driver()
+        master_conn = pyodbc.connect(
+            f"DRIVER={{{driver}}};SERVER={DatabaseManager().sql_server};DATABASE=master;Trusted_Connection=yes;TrustServerCertificate=yes;",
+            autocommit=True
+        )
+        cur = master_conn.cursor()
+        with open(sql_file, 'r', encoding='utf-8') as f:
+            content = f.read()
+        batches = [b.strip() for b in content.split('\nGO') if b.strip()]
+        for batch in batches:
+            lines = [line for line in batch.split('\n') if not line.strip().startswith('--')]
+            clean = '\n'.join(lines).strip()
+            if clean:
+                cur.execute(clean)
+        master_conn.close()
+        print("[INFO] Khởi tạo thành công CSDL CineVerse trên Microsoft SQL Server!")
+
 def init_database():
-    """Khởi tạo toàn bộ cấu trúc bảng cho hệ thống"""
+    """Khởi tạo toàn bộ cấu trúc bảng cho hệ thống (Hỗ trợ SQLite & SQL Server)"""
+    mgr = DatabaseManager()
+    if mgr.engine == "SQLSERVER":
+        init_sqlserver_database()
+        return
+
     conn = get_connection()
     cursor = conn.cursor()
 
@@ -375,7 +577,7 @@ def seed_data():
     """, showtimes)
 
     # 5. Tạo 1 vé mẫu đã đặt cho suất chiếu đầu tiên để kiểm tra ghế bị khóa
-    cursor.execute("SELECT id, room_id, base_price FROM showtimes LIMIT 1")
+    cursor.execute("SELECT id, room_id, base_price FROM showtimes")
     first_st = cursor.fetchone()
     if first_st:
         st_id = first_st['id']

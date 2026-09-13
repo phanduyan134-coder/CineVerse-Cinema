@@ -9,7 +9,7 @@ Mô tả: Tầng xử lý nghiệp vụ (Business Logic Layer)
 import sqlite3
 import random
 from datetime import datetime
-from database import get_connection, hash_password
+from database import get_connection, hash_password, DB_INTEGRITY_ERRORS
 from models import (
     User, Customer, Staff, Admin, Movie, Room, Seat, Showtime, Booking, Concession,
     UserFactory, PricingStrategy, StandardPricingStrategy, StudentPricingStrategy, 
@@ -61,7 +61,7 @@ class AuthService:
             """, (username.strip(), pwd_hash, fullname.strip(), email.strip(), phone.strip()))
             conn.commit()
             return True, "Đăng ký tài khoản thành công! Bạn có thể đăng nhập ngay."
-        except sqlite3.IntegrityError:
+        except DB_INTEGRITY_ERRORS:
             return False, f"Tên tài khoản '{username}' đã tồn tại! Vui lòng chọn tên khác."
         except Exception as e:
             return False, f"Lỗi hệ thống: {str(e)}"
@@ -100,7 +100,7 @@ class AuthService:
             """, (username.strip(), pwd_hash, fullname.strip(), email.strip(), phone.strip(), role.strip()))
             conn.commit()
             return True, f"Tạo tài khoản {role.upper()} '{username}' thành công!"
-        except sqlite3.IntegrityError:
+        except DB_INTEGRITY_ERRORS:
             return False, f"Tên tài khoản '{username}' đã tồn tại!"
         except Exception as e:
             return False, f"Lỗi: {str(e)}"
@@ -419,30 +419,33 @@ class CinemaService:
         cursor = conn.cursor()
         cursor.execute("""
         SELECT b.*, m.title as movie_title, r.name as room_name,
-               (st.show_date || ' lúc ' || st.show_time) as show_schedule,
-               GROUP_CONCAT(bd.seat_code, ', ') as seats_str
+               st.show_date, st.show_time
         FROM bookings b
         JOIN showtimes st ON b.showtime_id = st.id
         JOIN movies m ON st.movie_id = m.id
         JOIN rooms r ON st.room_id = r.id
-        LEFT JOIN booking_details bd ON b.id = bd.booking_id
         WHERE b.user_id = ?
-        GROUP BY b.id
         ORDER BY b.id DESC
         """, (user_id,))
         rows = cursor.fetchall()
 
         bookings = []
         for r in rows:
+            cursor.execute("SELECT seat_code FROM booking_details WHERE booking_id = ? ORDER BY seat_code", (r['id'],))
+            seat_rows = cursor.fetchall()
+            seats_str = ", ".join(s['seat_code'] for s in seat_rows)
+
             cursor.execute("SELECT quantity, concession_name FROM booking_concessions WHERE booking_id = ?", (r['id'],))
             fnb_rows = cursor.fetchall()
             fnb_str = ", ".join(f"{it['quantity']}x {it['concession_name']}" for it in fnb_rows)
+
+            show_schedule = f"{r['show_date']} lúc {r['show_time']}"
 
             b = Booking(
                 r['id'], r['booking_code'], r['user_id'], r['showtime_id'],
                 r['total_amount'], r['booking_date'], r['payment_method'],
                 r['status'], r['movie_title'], r['room_name'],
-                r['show_schedule'], r['seats_str'] or "",
+                show_schedule, seats_str,
                 concessions_str=fnb_str
             )
             bookings.append(b)
@@ -457,22 +460,25 @@ class CinemaService:
         cursor.execute("""
         SELECT b.id, b.booking_code, u.fullname as customer_name, u.phone as customer_phone,
                m.title as movie_title, r.name as room_name,
-               (st.show_date || ' ' || st.show_time) as show_time,
-               b.total_amount, b.booking_date, b.payment_method, b.status,
-               GROUP_CONCAT(bd.seat_code, ', ') as seats_str
+               st.show_date, st.show_time,
+               b.total_amount, b.booking_date, b.payment_method, b.status
         FROM bookings b
         JOIN users u ON b.user_id = u.id
         JOIN showtimes st ON b.showtime_id = st.id
         JOIN movies m ON st.movie_id = m.id
         JOIN rooms r ON st.room_id = r.id
-        LEFT JOIN booking_details bd ON b.id = bd.booking_id
-        GROUP BY b.id
         ORDER BY b.id DESC
         """)
         rows = cursor.fetchall()
         results = []
         for r in rows:
             d = dict(r)
+            d['show_time'] = f"{r['show_date']} {r['show_time']}"
+
+            cursor.execute("SELECT seat_code FROM booking_details WHERE booking_id = ? ORDER BY seat_code", (r['id'],))
+            seat_rows = cursor.fetchall()
+            d['seats_str'] = ", ".join(s['seat_code'] for s in seat_rows)
+
             cursor.execute("SELECT quantity, concession_name FROM booking_concessions WHERE booking_id = ?", (r['id'],))
             fnb_rows = cursor.fetchall()
             d['concessions_str'] = ", ".join(f"{it['quantity']}x {it['concession_name']}" for it in fnb_rows)
@@ -514,7 +520,7 @@ class CinemaService:
         LEFT JOIN showtimes st ON m.id = st.movie_id
         LEFT JOIN bookings b ON st.id = b.showtime_id AND b.status IN ('Confirmed', 'Checked-in')
         LEFT JOIN booking_details bd ON b.id = bd.booking_id
-        GROUP BY m.id
+        GROUP BY m.id, m.title
         ORDER BY movie_revenue DESC
         """)
         movie_stats = [dict(r) for r in cursor.fetchall()]
@@ -529,9 +535,8 @@ class CinemaService:
         FROM booking_concessions
         GROUP BY concession_id, concession_name
         ORDER BY total_qty DESC
-        LIMIT 5
         """)
-        fnb_stats = [dict(r) for r in cursor.fetchall()]
+        fnb_stats = [dict(r) for r in cursor.fetchall()[:5]]
 
         conn.close()
         return {
@@ -561,16 +566,13 @@ class CinemaService:
         cursor.execute("""
         SELECT b.*, u.fullname as customer_name, u.phone as customer_phone,
                m.title as movie_title, r.name as room_name,
-               (st.show_date || ' ' || st.show_time) as show_time,
-               GROUP_CONCAT(bd.seat_code, ', ') as seats_str
+               st.show_date, st.show_time
         FROM bookings b
         JOIN users u ON b.user_id = u.id
         JOIN showtimes st ON b.showtime_id = st.id
         JOIN movies m ON st.movie_id = m.id
         JOIN rooms r ON st.room_id = r.id
-        LEFT JOIN booking_details bd ON b.id = bd.booking_id
         WHERE UPPER(b.booking_code) = ?
-        GROUP BY b.id
         """, (code,))
         row = cursor.fetchone()
 
@@ -579,6 +581,12 @@ class CinemaService:
             return False, f"Mã vé '{code}' KHÔNG TỒN TẠI trên hệ thống CINEVERSE!", None
 
         ticket_info = dict(row)
+        ticket_info['show_time'] = f"{row['show_date']} {row['show_time']}"
+
+        cursor.execute("SELECT seat_code FROM booking_details WHERE booking_id = ? ORDER BY seat_code", (row['id'],))
+        seat_rows = cursor.fetchall()
+        ticket_info['seats_str'] = ", ".join(s['seat_code'] for s in seat_rows)
+
         cursor.execute("SELECT quantity, concession_name FROM booking_concessions WHERE booking_id = ?", (row['id'],))
         fnb_rows = cursor.fetchall()
         ticket_info['concessions_str'] = ", ".join(f"{it['quantity']}x {it['concession_name']}" for it in fnb_rows)
@@ -620,15 +628,13 @@ class CinemaService:
         query = """
         SELECT b.id, b.booking_code, u.fullname as customer_name, u.phone as customer_phone,
                m.title as movie_title, r.name as room_name,
-               (st.show_date || ' ' || st.show_time) as show_time,
-               b.total_amount, b.booking_date, b.payment_method, b.status,
-               GROUP_CONCAT(bd.seat_code, ', ') as seats_str
+               st.show_date, st.show_time,
+               b.total_amount, b.booking_date, b.payment_method, b.status
         FROM bookings b
         JOIN users u ON b.user_id = u.id
         JOIN showtimes st ON b.showtime_id = st.id
         JOIN movies m ON st.movie_id = m.id
         JOIN rooms r ON st.room_id = r.id
-        LEFT JOIN booking_details bd ON b.id = bd.booking_id
         WHERE 1=1
         """
         params = []
@@ -637,12 +643,18 @@ class CinemaService:
             query += " AND (b.booking_code LIKE ? OR u.fullname LIKE ? OR u.phone LIKE ? OR m.title LIKE ?)"
             params.extend([kw, kw, kw, kw])
 
-        query += " GROUP BY b.id ORDER BY b.id DESC"
+        query += " ORDER BY b.id DESC"
         cursor.execute(query, params)
         rows = cursor.fetchall()
         results = []
         for r in rows:
             d = dict(r)
+            d['show_time'] = f"{r['show_date']} {r['show_time']}"
+
+            cursor.execute("SELECT seat_code FROM booking_details WHERE booking_id = ? ORDER BY seat_code", (r['id'],))
+            seat_rows = cursor.fetchall()
+            d['seats_str'] = ", ".join(s['seat_code'] for s in seat_rows)
+
             cursor.execute("SELECT quantity, concession_name FROM booking_concessions WHERE booking_id = ?", (r['id'],))
             fnb_rows = cursor.fetchall()
             d['concessions_str'] = ", ".join(f"{it['quantity']}x {it['concession_name']}" for it in fnb_rows)
