@@ -17,6 +17,7 @@ Thumbs.db
 .idea/
 # Local reports and presentation files (kept local for submission)
 docs/*.docx
+docs/*.pptx
 docs/AI_DECLARATION.md
 docs/KICH_BAN_DEMO_VA_SLIDE.md
 docs/TIEU_CHI_DANH_GIA.md
